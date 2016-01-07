@@ -49,9 +49,13 @@ private[redshift] case class RedshiftRelation(
       new URI(params.rootTempDir), sqlContext.sparkContext.hadoopConfiguration)
   }
 
+  private val tableNameOrSubquery =
+    params.query.map(q => s"($q)").orElse(params.table.map(_.toString)).get
+
   override lazy val schema: StructType = {
     userSchema.getOrElse {
-      val tableNameOrSubquery = params.query.map(q => s"($q)").orElse(params.table).get
+      val tableNameOrSubquery =
+        params.query.map(q => s"($q)").orElse(params.table.map(_.toString)).get
       val conn = jdbcWrapper.getConnector(params.jdbcDriver, params.jdbcUrl)
       try {
         jdbcWrapper.resolveTable(conn, tableNameOrSubquery)
@@ -60,6 +64,8 @@ private[redshift] case class RedshiftRelation(
       }
     }
   }
+
+  override def toString: String = s"RedshiftRelation($tableNameOrSubquery)"
 
   override def insert(data: DataFrame, overwrite: Boolean): Unit = {
     val saveMode = if (overwrite) {
@@ -71,6 +77,13 @@ private[redshift] case class RedshiftRelation(
     writer.saveToRedshift(sqlContext, data, saveMode, params)
   }
 
+  // In Spark 1.6+, this method allows a data source to declare which filters it handles, allowing
+  // Spark to skip its own defensive filtering. See SPARK-10978 for more details. As long as we
+  // compile against Spark 1.4, we cannot use the `override` modifier here.
+  def unhandledFilters(filters: Array[Filter]): Array[Filter] = {
+    filters.filterNot(filter => FilterPushdown.buildFilterExpression(schema, filter).isDefined)
+  }
+
   override def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row] = {
     val creds =
       AWSCredentialsUtils.load(params.rootTempDir, sqlContext.sparkContext.hadoopConfiguration)
@@ -79,12 +92,11 @@ private[redshift] case class RedshiftRelation(
       // In the special case where no columns were requested, issue a `count(*)` against Redshift
       // rather than unloading data.
       val whereClause = FilterPushdown.buildWhereClause(schema, filters)
-      val tableNameOrSubquery = params.query.map(q => s"($q)").orElse(params.table).get
       val countQuery = s"SELECT count(*) FROM $tableNameOrSubquery $whereClause"
       log.info(countQuery)
       val conn = jdbcWrapper.getConnector(params.jdbcDriver, params.jdbcUrl)
       try {
-        val results = conn.prepareStatement(countQuery).executeQuery()
+        val results = jdbcWrapper.executeQueryInterruptibly(conn.prepareStatement(countQuery))
         if (results.next()) {
           val numRows = results.getLong(1)
           val parallelism = sqlContext.getConf("spark.sql.shuffle.partitions", "200").toInt
@@ -103,7 +115,7 @@ private[redshift] case class RedshiftRelation(
       log.info(unloadSql)
       val conn = jdbcWrapper.getConnector(params.jdbcDriver, params.jdbcUrl)
       try {
-        conn.prepareStatement(unloadSql).execute()
+        jdbcWrapper.executeInterruptibly(conn.prepareStatement(unloadSql))
       } finally {
         conn.close()
       }
@@ -135,13 +147,12 @@ private[redshift] case class RedshiftRelation(
     val query = {
       // Since the query passed to UNLOAD will be enclosed in single quotes, we need to escape
       // any single quotes that appear in the query itself
-      val tableNameOrSubquery: String = {
-        val unescaped = params.query.map(q => s"($q)").orElse(params.table).get
-        unescaped.replace("'", "\\'")
-      }
-      s"SELECT $columnList FROM $tableNameOrSubquery $whereClause"
+      val escapedTableNameOrSubqury = tableNameOrSubquery.replace("'", "\\'")
+      s"SELECT $columnList FROM $escapedTableNameOrSubqury $whereClause"
     }
-    val fixedUrl = Utils.fixS3Url(tempDir)
+    // We need to remove S3 credentials from the unload path URI because they will conflict with
+    // the credentials passed via `credsString`.
+    val fixedUrl = Utils.fixS3Url(Utils.removeCredentialsFromURI(new URI(tempDir)).toString)
 
     s"UNLOAD ('$query') TO '$fixedUrl' WITH CREDENTIALS '$credsString' ESCAPE"
   }

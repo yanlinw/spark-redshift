@@ -16,7 +16,6 @@
 
 package com.databricks.spark.redshift
 
-import java.io.File
 import java.net.URI
 import java.util.UUID
 
@@ -27,7 +26,6 @@ import com.amazonaws.services.s3.{AmazonS3URI, AmazonS3Client}
 import com.amazonaws.services.s3.model.BucketLifecycleConfiguration
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.FileSystem
-import org.apache.hadoop.fs.s3.S3FileSystem
 import org.slf4j.LoggerFactory
 
 /**
@@ -50,9 +48,7 @@ private[redshift] object Utils {
    * a temp directory path for S3.
    */
   def joinUrls(a: String, b: String): String = {
-    val aUri = new URI(a)
-    val joinedPath = new File(aUri.getPath, b).toString
-    new URI(aUri.getScheme, aUri.getHost, joinedPath, null).toString + "/"
+    a.stripSuffix("/") + "/" + b.stripPrefix("/").stripSuffix("/") + "/"
   }
 
   /**
@@ -61,6 +57,20 @@ private[redshift] object Utils {
    */
   def fixS3Url(url: String): String = {
     url.replaceAll("s3[an]://", "s3://")
+  }
+
+  /**
+   * Returns a copy of the given URI with the user credentials removed.
+   */
+  def removeCredentialsFromURI(uri: URI): URI = {
+    new URI(
+      uri.getScheme,
+      null, // no user info
+      uri.getHost,
+      uri.getPort,
+      uri.getPath,
+      uri.getQuery,
+      uri.getFragment)
   }
 
   /**
@@ -79,20 +89,25 @@ private[redshift] object Utils {
     try {
       val s3URI = new AmazonS3URI(Utils.fixS3Url(tempDir))
       val bucket = s3URI.getBucket
-      val bucketLifecycleConfiguration = s3Client.getBucketLifecycleConfiguration(bucket)
-      val key = s3URI.getKey
-      val someRuleMatchesTempDir = bucketLifecycleConfiguration.getRules.asScala.exists { rule =>
-        // Note: this only checks that there is an active rule which matches the temp directory;
-        // it does not actually check that the rule will delete the files. This check is still
-        // better than nothing, though, and we can always improve it later.
-        rule.getStatus == BucketLifecycleConfiguration.ENABLED && key.startsWith(rule.getPrefix)
-      }
-      if (!someRuleMatchesTempDir) {
-        log.warn(s"The S3 bucket $bucket does not have an object lifecycle configuration to " +
-          "ensure cleanup of temporary files. Consider configuring `tempdir` to point to a " +
-          "bucket with an object lifecycle policy that automatically deletes files after an " +
-          "expiration period. For more information, see " +
-          "https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lifecycle-mgmt.html")
+      assert(bucket != null, "Could not get bucket from S3 URI")
+      val key = Option(s3URI.getKey).getOrElse("")
+      Option(s3Client.getBucketLifecycleConfiguration(bucket)) match {
+        case None =>
+          log.error(s"The S3 bucket $bucket does not exist")
+        case Some(lifecycleConfiguration) =>
+          val someRuleMatchesTempDir = lifecycleConfiguration.getRules.asScala.exists { rule =>
+            // Note: this only checks that there is an active rule which matches the temp directory;
+            // it does not actually check that the rule will delete the files. This check is still
+            // better than nothing, though, and we can always improve it later.
+            rule.getStatus == BucketLifecycleConfiguration.ENABLED && key.startsWith(rule.getPrefix)
+          }
+          if (!someRuleMatchesTempDir) {
+            log.warn(s"The S3 bucket $bucket does not have an object lifecycle configuration to " +
+              "ensure cleanup of temporary files. Consider configuring `tempdir` to point to a " +
+              "bucket with an object lifecycle policy that automatically deletes files after an " +
+              "expiration period. For more information, see " +
+              "https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lifecycle-mgmt.html")
+          }
       }
     } catch {
       case NonFatal(e) =>
@@ -108,8 +123,10 @@ private[redshift] object Utils {
   def assertThatFileSystemIsNotS3BlockFileSystem(uri: URI, hadoopConfig: Configuration): Unit = {
     val fs = FileSystem.get(uri, hadoopConfig)
     // Note that we do not want to use isInstanceOf here, since we're only interested in detecting
-    // exact matches
-    if (fs.getClass == classOf[S3FileSystem]) {
+    // exact matches. We compare the class names as strings in order to avoid introducing a binary
+    // dependency on classes which belong to the `hadoop-aws` JAR, as that artifact is not present
+    // in some environments (such as EMR). See #92 for details.
+    if (fs.getClass.getCanonicalName == "org.apache.hadoop.fs.s3.S3FileSystem") {
       throw new IllegalArgumentException(
         "spark-redshift does not support the S3 Block FileSystem. Please reconfigure `tempdir` to" +
         "use a s3n:// or s3a:// scheme.")

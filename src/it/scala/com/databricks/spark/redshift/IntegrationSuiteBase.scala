@@ -23,9 +23,11 @@ import scala.util.Random
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{Path, FileSystem}
+import org.apache.hadoop.fs.s3native.NativeS3FileSystem
 import org.apache.spark.SparkContext
-import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.{DataFrame, SaveMode, SQLContext}
 import org.apache.spark.sql.hive.test.TestHiveContext
+import org.apache.spark.sql.types.StructType
 import org.scalatest.{BeforeAndAfterEach, BeforeAndAfterAll, Matchers}
 
 
@@ -55,10 +57,10 @@ trait IntegrationSuiteBase
   protected val AWS_ACCESS_KEY_ID: String = loadConfigFromEnv("TEST_AWS_ACCESS_KEY_ID")
   protected val AWS_SECRET_ACCESS_KEY: String = loadConfigFromEnv("TEST_AWS_SECRET_ACCESS_KEY")
   // Path to a directory in S3 (e.g. 's3n://bucket-name/path/to/scratch/space').
-  private val AWS_S3_SCRATCH_SPACE: String = loadConfigFromEnv("AWS_S3_SCRATCH_SPACE")
+  protected val AWS_S3_SCRATCH_SPACE: String = loadConfigFromEnv("AWS_S3_SCRATCH_SPACE")
   require(AWS_S3_SCRATCH_SPACE.contains("s3n"), "must use s3n:// URL")
 
-  protected val jdbcUrl: String = {
+  protected def jdbcUrl: String = {
     s"$AWS_REDSHIFT_JDBC_URL?user=$AWS_REDSHIFT_USER&password=$AWS_REDSHIFT_PASSWORD"
   }
 
@@ -97,6 +99,8 @@ trait IntegrationSuiteBase
       // Bypass Hadoop's FileSystem caching mechanism so that we don't cache the credentials:
       conf.setBoolean("fs.s3.impl.disable.cache", true)
       conf.setBoolean("fs.s3n.impl.disable.cache", true)
+      conf.set("fs.s3.impl", classOf[NativeS3FileSystem].getCanonicalName)
+      conf.set("fs.s3n.impl", classOf[NativeS3FileSystem].getCanonicalName)
       val fs = FileSystem.get(URI.create(tempDir), conf)
       fs.delete(new Path(tempDir), true)
       fs.close()
@@ -116,5 +120,44 @@ trait IntegrationSuiteBase
   override protected def beforeEach(): Unit = {
     super.beforeEach()
     sqlContext = new TestHiveContext(sc)
+  }
+
+  /**
+   * Save the given DataFrame to Redshift, then load the results back into a DataFrame and check
+   * that the returned DataFrame matches the one that we saved.
+   *
+   * @param tableName the table name to use
+   * @param df the DataFrame to save
+   * @param expectedSchemaAfterLoad if specified, the expected schema after loading the data back
+   *                                from Redshift. This should be used in cases where you expect
+   *                                the schema to differ due to reasons like case-sensitivity.
+   * @param saveMode the [[SaveMode]] to use when writing data back to Redshift
+   */
+  def testRoundtripSaveAndLoad(
+      tableName: String,
+      df: DataFrame,
+      expectedSchemaAfterLoad: Option[StructType] = None,
+      saveMode: SaveMode = SaveMode.ErrorIfExists): Unit = {
+    try {
+      df.write
+        .format("com.databricks.spark.redshift")
+        .option("url", jdbcUrl)
+        .option("dbtable", tableName)
+        .option("tempdir", tempDir)
+        .mode(saveMode)
+        .save()
+      assert(DefaultJDBCWrapper.tableExists(conn, tableName))
+      val loadedDf = sqlContext.read
+        .format("com.databricks.spark.redshift")
+        .option("url", jdbcUrl)
+        .option("dbtable", tableName)
+        .option("tempdir", tempDir)
+        .load()
+      assert(loadedDf.schema === expectedSchemaAfterLoad.getOrElse(df.schema))
+      checkAnswer(loadedDf, df.collect())
+    } finally {
+      conn.prepareStatement(s"drop table if exists $tableName").executeUpdate()
+      conn.commit()
+    }
   }
 }

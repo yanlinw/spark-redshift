@@ -17,10 +17,14 @@
 
 package com.databricks.spark.redshift
 
-import java.net.URI
-import java.sql.{Connection, Driver, DriverManager, ResultSetMetaData, SQLException}
+import java.sql.{ResultSet, PreparedStatement, Connection, Driver, DriverManager, ResultSetMetaData, SQLException}
 import java.util.Properties
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.{ThreadFactory, Executors}
 
+import scala.collection.JavaConverters._
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.duration.Duration
 import scala.util.Try
 
 import org.apache.spark.SPARK_VERSION
@@ -35,28 +39,42 @@ private[redshift] class JDBCWrapper {
 
   private val log = LoggerFactory.getLogger(getClass)
 
+  private val ec: ExecutionContext = {
+    val threadFactory = new ThreadFactory {
+      private[this] val count = new AtomicInteger()
+      override def newThread(r: Runnable) = {
+        val thread = new Thread(r)
+        thread.setName(s"spark-redshift-JDBCWrapper-${count.incrementAndGet}")
+        thread.setDaemon(true)
+        thread
+      }
+    }
+    ExecutionContext.fromExecutorService(Executors.newCachedThreadPool(threadFactory))
+  }
+
   /**
-   * Given a JDBC subprotocol, returns the appropriate driver class so that it can be registered
-   * with Spark. If the user has explicitly specified a driver class in their configuration then
-   * that class will be used. Otherwise, we will attempt to load the correct driver class based on
+   * Given a JDBC subprotocol, returns the name of the appropriate driver class to use.
+   *
+   * If the user has explicitly specified a driver class in their configuration then that class will
+   * be used. Otherwise, we will attempt to load the correct driver class based on
    * the JDBC subprotocol.
    *
-   * @param jdbcSubprotocol 'redshift' or 'postgres'
+   * @param jdbcSubprotocol 'redshift' or 'postgresql'
    * @param userProvidedDriverClass an optional user-provided explicit driver class name
    * @return the driver class
    */
   private def getDriverClass(
       jdbcSubprotocol: String,
-      userProvidedDriverClass: Option[String]): Class[Driver] = {
-    userProvidedDriverClass.map(Utils.classForName).getOrElse {
+      userProvidedDriverClass: Option[String]): String = {
+    userProvidedDriverClass.getOrElse {
       jdbcSubprotocol match {
         case "redshift" =>
           try {
-            Utils.classForName("com.amazon.redshift.jdbc41.Driver")
+            Utils.classForName("com.amazon.redshift.jdbc41.Driver").getName
           } catch {
             case _: ClassNotFoundException =>
               try {
-                Utils.classForName("com.amazon.redshift.jdbc4.Driver")
+                Utils.classForName("com.amazon.redshift.jdbc4.Driver").getName
               } catch {
                 case e: ClassNotFoundException =>
                   throw new ClassNotFoundException(
@@ -64,12 +82,16 @@ private[redshift] class JDBCWrapper {
                       "instructions on downloading and configuring the official Amazon driver.", e)
               }
           }
-        case "postgres" => Utils.classForName("org.postgresql.Driver")
+        case "postgresql" => "org.postgresql.Driver"
         case other => throw new IllegalArgumentException(s"Unsupported JDBC protocol: '$other'")
       }
-    }.asInstanceOf[Class[Driver]]
+    }
   }
 
+  /**
+   * Reflectively calls Spark's `DriverRegistry.register()`, which handles corner-cases related to
+   * using JDBC drivers that are not accessible from the bootstrap classloader.
+   */
   private def registerDriver(driverClass: String): Unit = {
     // DriverRegistry.register() is one of the few pieces of private Spark functionality which
     // we need to rely on. This class was relocated in Spark 1.5.0, so we need to use reflection
@@ -89,6 +111,48 @@ private[redshift] class JDBCWrapper {
   }
 
   /**
+   * Execute the given SQL statement while supporting interruption.
+   * If InterruptedException is caught, then the statement will be cancelled if it is running.
+   *
+   * @return <code>true</code> if the first result is a <code>ResultSet</code>
+   *         object; <code>false</code> if the first result is an update
+   *         count or there is no result
+   */
+  def executeInterruptibly(statement: PreparedStatement): Boolean = {
+    executeInterruptibly(statement, _.execute())
+  }
+
+  /**
+   * Execute the given SQL statement while supporting interruption.
+   * If InterruptedException is caught, then the statement will be cancelled if it is running.
+   *
+   * @return a <code>ResultSet</code> object that contains the data produced by the
+   *         query; never <code>null</code>
+   */
+  def executeQueryInterruptibly(statement: PreparedStatement): ResultSet = {
+    executeInterruptibly(statement, _.executeQuery())
+  }
+
+  private def executeInterruptibly[T](
+      statement: PreparedStatement,
+      op: PreparedStatement => T): T = {
+    try {
+      val future = Future[T](op(statement))(ec)
+      Await.result(future, Duration.Inf)
+    } catch {
+      case e: InterruptedException =>
+        try {
+          statement.cancel()
+          throw e
+        } catch {
+          case s: SQLException =>
+            log.error("Exception occurred while cancelling query", s)
+            throw e
+        }
+    }
+  }
+
+  /**
    * Takes a (schema, table) specification and returns the table's Catalyst
    * schema.
    *
@@ -101,7 +165,7 @@ private[redshift] class JDBCWrapper {
    * @throws SQLException if the table contains an unsupported type.
    */
   def resolveTable(conn: Connection, table: String): StructType = {
-    val rs = conn.prepareStatement(s"SELECT * FROM $table WHERE 1=0").executeQuery()
+    val rs = executeQueryInterruptibly(conn.prepareStatement(s"SELECT * FROM $table WHERE 1=0"))
     try {
       val rsmd = rs.getMetaData
       val ncols = rsmd.getColumnCount
@@ -134,10 +198,31 @@ private[redshift] class JDBCWrapper {
    * @param url the JDBC url to connect to.
    */
   def getConnector(userProvidedDriverClass: Option[String], url: String): Connection = {
-    val subprotocol = new URI(url.stripPrefix("jdbc:")).getScheme
-    val driverClass: Class[Driver] = getDriverClass(subprotocol, userProvidedDriverClass)
-    registerDriver(driverClass.getCanonicalName)
-    DriverManager.getConnection(url, new Properties())
+    val subprotocol = url.stripPrefix("jdbc:").split(":")(0)
+    val driverClass: String = getDriverClass(subprotocol, userProvidedDriverClass)
+    registerDriver(driverClass)
+    val driverWrapperClass: Class[_] = if (SPARK_VERSION.startsWith("1.4")) {
+      Utils.classForName("org.apache.spark.sql.jdbc.package$DriverWrapper")
+    } else { // Spark 1.5.0+
+      Utils.classForName("org.apache.spark.sql.execution.datasources.jdbc.DriverWrapper")
+    }
+    def getWrapped(d: Driver): Driver = {
+      require(driverWrapperClass.isAssignableFrom(d.getClass))
+      driverWrapperClass.getDeclaredMethod("wrapped").invoke(d).asInstanceOf[Driver]
+    }
+    // Note that we purposely don't call DriverManager.getConnection() here: we want to ensure
+    // that an explicitly-specified user-provided driver class can take precedence over the default
+    // class, but DriverManager.getConnection() might return a according to a different precedence.
+    // At the same time, we don't want to create a driver-per-connection, so we use the
+    // DriverManager's driver instances to handle that singleton logic for us.
+    val driver: Driver = DriverManager.getDrivers.asScala.collectFirst {
+      case d if driverWrapperClass.isAssignableFrom(d.getClass)
+        && getWrapped(d).getClass.getCanonicalName == driverClass => d
+      case d if d.getClass.getCanonicalName == driverClass => d
+    }.getOrElse {
+      throw new IllegalArgumentException(s"Did not find registered driver with class $driverClass")
+    }
+    driver.connect(url, new Properties())
   }
 
   /**
@@ -179,7 +264,9 @@ private[redshift] class JDBCWrapper {
   def tableExists(conn: Connection, table: String): Boolean = {
     // Somewhat hacky, but there isn't a good way to identify whether a table exists for all
     // SQL database systems, considering "table" could also include the database name.
-    Try(conn.prepareStatement(s"SELECT 1 FROM $table LIMIT 1").executeQuery().next()).isSuccess
+    Try {
+      executeQueryInterruptibly(conn.prepareStatement(s"SELECT 1 FROM $table LIMIT 1")).next()
+    }.isSuccess
   }
 
   /**

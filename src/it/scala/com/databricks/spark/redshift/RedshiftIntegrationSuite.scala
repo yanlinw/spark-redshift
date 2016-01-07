@@ -18,7 +18,7 @@ package com.databricks.spark.redshift
 
 import java.sql.SQLException
 
-import org.apache.spark.sql.{AnalysisException, Row, SQLContext, SaveMode}
+import org.apache.spark.sql.{execution, AnalysisException, Row, SaveMode}
 import org.apache.spark.sql.types._
 
 /**
@@ -268,7 +268,17 @@ class RedshiftIntegrationSuite extends IntegrationSuiteBase {
     // scalastyle:on
   }
 
+  test("RedshiftRelation implements Spark 1.6+'s unhandledFilters API") {
+    assume(org.apache.spark.SPARK_VERSION.take(3) >= "1.6")
+    val df = sqlContext.sql("select testbool from test_table where testbool = true")
+    val physicalPlan = df.queryExecution.sparkPlan
+    physicalPlan.collectFirst { case f: execution.Filter => f }.foreach { filter =>
+      fail(s"Filter should have been eliminated; plan is:\n$physicalPlan")
+    }
+  }
+
   test("roundtrip save and load") {
+    // This test can be simplified once #98 is fixed.
     val tableName = s"roundtrip_save_and_load_$randomSuffix"
     try {
       sqlContext.createDataFrame(sc.parallelize(TestUtils.expectedData), TestUtils.testSchema)
@@ -295,59 +305,37 @@ class RedshiftIntegrationSuite extends IntegrationSuiteBase {
   }
 
   test("roundtrip save and load with uppercase column names") {
-    val tableName = s"roundtrip_write_and_read_with_uppercase_column_names_$randomSuffix"
-    val df = sqlContext.createDataFrame(sc.parallelize(Seq(Row(1))),
-      StructType(StructField("A", IntegerType) :: Nil))
-    try {
-      df.write
-        .format("com.databricks.spark.redshift")
-        .option("url", jdbcUrl)
-        .option("dbtable", tableName)
-        .option("tempdir", tempDir)
-        .mode(SaveMode.ErrorIfExists)
-        .save()
-
-      assert(DefaultJDBCWrapper.tableExists(conn, tableName))
-      val loadedDf = sqlContext.read
-        .format("com.databricks.spark.redshift")
-        .option("url", jdbcUrl)
-        .option("dbtable", tableName)
-        .option("tempdir", tempDir)
-        .load()
-      assert(loadedDf.schema.length === 1)
-      assert(loadedDf.columns === Seq("a"))
-      checkAnswer(loadedDf, Seq(Row(1)))
-    } finally {
-      conn.prepareStatement(s"drop table if exists $tableName").executeUpdate()
-      conn.commit()
-    }
+    testRoundtripSaveAndLoad(
+      s"roundtrip_write_and_read_with_uppercase_column_names_$randomSuffix",
+      sqlContext.createDataFrame(sc.parallelize(Seq(Row(1))),
+        StructType(StructField("A", IntegerType) :: Nil)),
+      expectedSchemaAfterLoad = Some(StructType(StructField("a", IntegerType) :: Nil)))
   }
 
   test("save with column names that are reserved words") {
-    val tableName = s"save_with_column_names_that_are_reserved_words_$randomSuffix"
-    val df = sqlContext.createDataFrame(sc.parallelize(Seq(Row(1))),
-      StructType(StructField("table", IntegerType) :: Nil))
-    try {
-      df.write
-        .format("com.databricks.spark.redshift")
-        .option("url", jdbcUrl)
-        .option("dbtable", tableName)
-        .option("tempdir", tempDir)
-        .mode(SaveMode.ErrorIfExists)
-        .save()
-      assert(DefaultJDBCWrapper.tableExists(conn, tableName))
-      val loadedDf = sqlContext.read
-        .format("com.databricks.spark.redshift")
-        .option("url", jdbcUrl)
-        .option("dbtable", tableName)
-        .option("tempdir", tempDir)
-        .load()
-      assert(loadedDf.schema === df.schema)
-      checkAnswer(loadedDf, Seq(Row(1)))
-    } finally {
-      conn.prepareStatement(s"drop table if exists $tableName").executeUpdate()
-      conn.commit()
-    }
+    testRoundtripSaveAndLoad(
+      s"save_with_column_names_that_are_reserved_words_$randomSuffix",
+      sqlContext.createDataFrame(sc.parallelize(Seq(Row(1))),
+        StructType(StructField("table", IntegerType) :: Nil)))
+  }
+
+  test("save with one empty partition (regression test for #96)") {
+    val df = sqlContext.createDataFrame(sc.parallelize(Seq(Row(1)), 2),
+      StructType(StructField("foo", IntegerType) :: Nil))
+    assert(df.rdd.glom.collect() === Array(Array.empty[Row], Array(Row(1))))
+    testRoundtripSaveAndLoad(s"save_with_one_empty_partition_$randomSuffix", df)
+  }
+
+  test("save with all empty partitions (regression test for #96)") {
+    val df = sqlContext.createDataFrame(sc.parallelize(Seq.empty[Row], 2),
+      StructType(StructField("foo", IntegerType) :: Nil))
+    assert(df.rdd.glom.collect() === Array(Array.empty[Row], Array.empty[Row]))
+    testRoundtripSaveAndLoad(s"save_with_all_empty_partitions_$randomSuffix", df)
+    // Now try overwriting that table. Although the new table is empty, it should still overwrite
+    // the existing table.
+    val df2 = df.withColumnRenamed("foo", "bar")
+    testRoundtripSaveAndLoad(
+      s"save_with_all_empty_partitions_$randomSuffix", df2, saveMode = SaveMode.Overwrite)
   }
 
   test("multiple scans on same table") {
@@ -419,31 +407,40 @@ class RedshiftIntegrationSuite extends IntegrationSuiteBase {
     }
   }
 
-  test("SaveMode.Overwrite with non-existent table") {
-    val tableName = s"overwrite_non_existent_table$randomSuffix"
+  test("SaveMode.Overwrite with schema-qualified table name (#97)") {
+    val tableName = s"overwrite_schema_qualified_table_name$randomSuffix"
+    val df = sqlContext.createDataFrame(sc.parallelize(Seq(Row(1))),
+      StructType(StructField("a", IntegerType) :: Nil))
     try {
-      assert(!DefaultJDBCWrapper.tableExists(conn, tableName))
-      sqlContext.createDataFrame(sc.parallelize(TestUtils.expectedData), TestUtils.testSchema)
-        .write
+      // Ensure that the table exists:
+      df.write
         .format("com.databricks.spark.redshift")
         .option("url", jdbcUrl)
         .option("dbtable", tableName)
+        .option("tempdir", tempDir)
+        .mode(SaveMode.ErrorIfExists)
+        .save()
+      assert(DefaultJDBCWrapper.tableExists(conn, s"PUBLIC.$tableName"))
+      // Try overwriting that table while using the schema-qualified table name:
+      df.write
+        .format("com.databricks.spark.redshift")
+        .option("url", jdbcUrl)
+        .option("dbtable", s"PUBLIC.$tableName")
         .option("tempdir", tempDir)
         .mode(SaveMode.Overwrite)
         .save()
-
-      assert(DefaultJDBCWrapper.tableExists(conn, tableName))
-      val loadedDf = sqlContext.read
-        .format("com.databricks.spark.redshift")
-        .option("url", jdbcUrl)
-        .option("dbtable", tableName)
-        .option("tempdir", tempDir)
-        .load()
-      checkAnswer(loadedDf, TestUtils.expectedData)
     } finally {
       conn.prepareStatement(s"drop table if exists $tableName").executeUpdate()
       conn.commit()
     }
+  }
+
+  test("SaveMode.Overwrite with non-existent table") {
+    testRoundtripSaveAndLoad(
+      s"overwrite_non_existent_table$randomSuffix",
+      sqlContext.createDataFrame(sc.parallelize(Seq(Row(1))),
+        StructType(StructField("a", IntegerType) :: Nil)),
+      saveMode = SaveMode.Overwrite)
   }
 
   test("SaveMode.Overwrite with existing table") {

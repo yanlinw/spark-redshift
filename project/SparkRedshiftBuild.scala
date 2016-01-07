@@ -26,6 +26,7 @@ import bintray.BintrayPlugin.autoImport._
 
 object SparkRedshiftBuild extends Build {
   val testSparkVersion = settingKey[String]("Spark version to test against")
+  val testSparkAvroVersion = settingKey[String]("spark-avro version to test against")
   val testHadoopVersion = settingKey[String]("Hadoop version to test against")
 
   // Define a custom test configuration so that unit test helper classes can be re-used under
@@ -45,6 +46,7 @@ object SparkRedshiftBuild extends Build {
       crossScalaVersions := Seq("2.10.5", "2.11.7"),
       sparkVersion := "1.4.1",
       testSparkVersion := sys.props.get("spark.testVersion").getOrElse(sparkVersion.value),
+      testSparkAvroVersion := sys.props.get("sparkAvro.testVersion").getOrElse("2.0.1"),
       testHadoopVersion := sys.props.get("hadoop.testVersion").getOrElse("2.2.0"),
       spName := "databricks/spark-redshift",
       sparkComponents ++= Seq("sql", "hive"),
@@ -53,6 +55,8 @@ object SparkRedshiftBuild extends Build {
       credentials += Credentials(Path.userHome / ".ivy2" / ".credentials"),
       resolvers +=
         "Sonatype OSS Snapshots" at "https://oss.sonatype.org/content/repositories/snapshots",
+      scalacOptions ++= Seq("-target:jvm-1.6"),
+      javacOptions ++= Seq("-source", "1.6", "-target", "1.6"),
       libraryDependencies ++= Seq(
         "org.slf4j" % "slf4j-api" % "1.7.5",
         // These Amazon SDK depdencies are marked as 'provided' in order to reduce the risk of
@@ -64,9 +68,10 @@ object SparkRedshiftBuild extends Build {
         // There's a trade-off here and we've chosen to err on the side of minimizing dependency
         // conflicts for a majority of users while adding a minor inconvienece (adding one extra
         // depenendecy by hand) for a smaller set of users.
-        "com.amazonaws" % "aws-java-sdk-core" % "1.9.40" % "provided",
-        "com.amazonaws" % "aws-java-sdk-s3" % "1.9.40" % "provided",
-        "com.amazonaws" % "aws-java-sdk-sts" % "1.9.40" % "test",
+        // We exclude jackson-databind to avoid a conflict with Spark's version (see #104).
+        "com.amazonaws" % "aws-java-sdk-core" % "1.10.22" % "provided" exclude("com.fasterxml.jackson.core", "jackson-databind"),
+        "com.amazonaws" % "aws-java-sdk-s3" % "1.10.22" % "provided" exclude("com.fasterxml.jackson.core", "jackson-databind"),
+        "com.amazonaws" % "aws-java-sdk-sts" % "1.10.22" % "test" exclude("com.fasterxml.jackson.core", "jackson-databind"),
         // We require spark-avro, but avro-mapred must be provided to match Hadoop version.
         // In most cases, avro-mapred will be provided as part of the Spark assembly JAR.
         "com.databricks" %% "spark-avro" % "2.0.1",
@@ -79,6 +84,9 @@ object SparkRedshiftBuild extends Build {
         // For testing, we use an Amazon driver, which is available from
         // http://docs.aws.amazon.com/redshift/latest/mgmt/configure-jdbc-connection.html
         "com.amazon.redshift" % "jdbc4" % "1.1.7.1007" % "test" from "https://s3.amazonaws.com/redshift-downloads/drivers/RedshiftJDBC4-1.1.7.1007.jar",
+        // Although support for the postgres driver is lower priority than support for Amazon's
+        // official Redshift driver, we still run basic tests with it.
+        "postgresql" % "postgresql" % "8.3-606.jdbc4" % "test",
         "com.google.guava" % "guava" % "14.0.1" % "test",
         "org.scalatest" %% "scalatest" % "2.2.1" % "test",
         "org.mockito" % "mockito-core" % "1.10.19" % "test"
@@ -98,7 +106,8 @@ object SparkRedshiftBuild extends Build {
       libraryDependencies ++= Seq(
         "org.apache.spark" %% "spark-core" % testSparkVersion.value % "test" exclude("org.apache.hadoop", "hadoop-client") force(),
         "org.apache.spark" %% "spark-sql" % testSparkVersion.value % "test" exclude("org.apache.hadoop", "hadoop-client") force(),
-        "org.apache.spark" %% "spark-hive" % testSparkVersion.value % "test" exclude("org.apache.hadoop", "hadoop-client") force()
+        "org.apache.spark" %% "spark-hive" % testSparkVersion.value % "test" exclude("org.apache.hadoop", "hadoop-client") force(),
+        "com.databricks" %% "spark-avro" % testSparkAvroVersion.value % "test" exclude("org.apache.avro", "avro-mapred") force()
       ),
       // Although spark-avro declares its avro-mapred dependency as `provided`, its version of the
       // dependency can still end up on the classpath during tests, which breaks the tests for
@@ -109,6 +118,15 @@ object SparkRedshiftBuild extends Build {
         }
       } else {
         (fullClasspath in Test).value.filterNot {
+          x => x.data.getName.contains("hadoop1") && x.data.getName.contains("avro")
+        }
+      }),
+      (fullClasspath in IntegrationTest) := (if (testHadoopVersion.value.startsWith("1")) {
+        (fullClasspath in IntegrationTest).value.filterNot {
+          x => x.data.getName.contains("hadoop2") && x.data.getName.contains("avro")
+        }
+      } else {
+        (fullClasspath in IntegrationTest).value.filterNot {
           x => x.data.getName.contains("hadoop1") && x.data.getName.contains("avro")
         }
       }),
